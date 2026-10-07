@@ -11,7 +11,7 @@ from coldstore.fan import PRIMARY, STANDBY
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
-from coldstore.reporting import audit_export, telemetry_export, to_csv
+from coldstore.reporting import accounting_export, audit_export, telemetry_export, to_csv
 from coldstore.room import validate_zone
 from coldstore.scheduler import validate_threshold as validate_schedule_threshold
 from coldstore.store import export_state
@@ -24,7 +24,7 @@ from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import Request, RequestError, Response, csv_response, json_response, text_response
 from .report import text_report
 from .routes import route_table
 from .system import system_payload
@@ -645,6 +645,132 @@ def audit_filter(server: "Server", request: Request) -> Response:
 
 def audit_totals(server: "Server", request: Request) -> Response:
     return json_response({"totals": server.runtime.auditor.totals()})
+
+
+def accounting_state(server: "Server", request: Request) -> Response:
+    state = server.runtime.accounting.state(
+        start=_optional_int(request, "start"),
+        end=_optional_int(request, "end"),
+    )
+    return json_response(_accounting_payload(state))
+
+
+def accounting_register(server: "Server", request: Request) -> Response:
+    registry = server.runtime.accounting
+    batch_id = request.str_field("batch_id")
+    discharge = _optional_int(request, "discharge_seconds")
+    try:
+        voucher, bucket = registry.register_batch(
+            batch_id=batch_id,
+            at=request.int_field("at"),
+            mass_kg=request.float_field("mass_kg"),
+            product_temp=request.float_field("product_temp"),
+            discharge_seconds=discharge,
+        )
+    except ValueError as exc:
+        if "already registered" in str(exc):
+            raise RequestError(409, str(exc)) from exc
+        raise
+    if not voucher.accepted:
+        return json_response(
+            {"voucher": voucher.as_dict(), "accepted": False, "bucket": None}, status=429
+        )
+    return json_response(
+        {
+            "voucher": voucher.as_dict(),
+            "accepted": True,
+            "bucket": bucket.as_dict() if bucket else None,
+        }
+    )
+
+
+def accounting_voucher(server: "Server", request: Request) -> Response:
+    voucher = server.runtime.accounting.vouchers.get(request.str_field("batch_id"))
+    if voucher is None:
+        raise RequestError(404, "voucher not found")
+    return json_response({"voucher": voucher.as_dict()})
+
+
+def accounting_defrost(server: "Server", request: Request) -> Response:
+    energy, buckets = server.runtime.accounting.record_defrost(
+        room_id=request.str_field("room_id"),
+        start=request.int_field("start"),
+        end=request.int_field("end"),
+    )
+    return json_response(
+        {"energy_kwh": energy, "buckets": [bucket.as_dict() for bucket in buckets]}
+    )
+
+
+def accounting_envelope(server: "Server", request: Request) -> Response:
+    ambient = request.float_field("ambient") if "ambient" in request.payload else None
+    buckets = server.runtime.accounting.record_envelope(request.int_field("at"), ambient)
+    return json_response({"buckets": [bucket.as_dict() for bucket in buckets]})
+
+
+def accounting_load(server: "Server", request: Request) -> Response:
+    buckets = server.runtime.accounting.load_range(
+        start=request.int_field("start"), end=request.int_field("end")
+    )
+    return json_response({"buckets": [bucket.as_dict() for bucket in buckets]})
+
+
+def accounting_reconcile(server: "Server", request: Request) -> Response:
+    reconciliation = server.runtime.accounting.reconcile()
+    return json_response(reconciliation.as_dict())
+
+
+def accounting_params(server: "Server", request: Request) -> Response:
+    registry = server.runtime.accounting
+    params = registry.set_params(
+        product_cp=_optional_float(request, "product_cp"),
+        room_temp=_optional_float(request, "room_temp"),
+        u_area=_optional_float(request, "u_area"),
+        ambient=_optional_float(request, "ambient"),
+        defrost_power=_optional_float(request, "defrost_power"),
+        discharge_seconds=_optional_int(request, "discharge_seconds"),
+        rate_per_hour=_optional_float(request, "rate_per_hour"),
+        rate_burst=_optional_float(request, "rate_burst"),
+        max_span_buckets=_optional_int(request, "max_span_buckets"),
+    )
+    return json_response({"params": params.as_dict()})
+
+
+def accounting_limiter(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.accounting.limiter_state(request.int_field("at")))
+
+
+def accounting_export_route(server: "Server", request: Request) -> Response:
+    buckets = server.runtime.accounting.load_range(
+        start=request.int_field("start"), end=request.int_field("end")
+    )
+    columns, rows = accounting_export(buckets)
+    return csv_response(to_csv(columns, rows))
+
+
+def _optional_int(request: Request, name: str) -> int | None:
+    if name not in request.payload:
+        return None
+    return request.int_field(name)
+
+
+def _optional_float(request: Request, name: str) -> float | None:
+    if name not in request.payload:
+        return None
+    return request.float_field(name)
+
+
+def _accounting_payload(state: dict[str, object]) -> dict[str, object]:
+    return {
+        "policy": state["policy"],
+        "params": state["params"].as_dict(),
+        "vouchers": [voucher.as_dict() for voucher in state["vouchers"]],
+        "range": {"start": state["range_start"], "end": state["range_end"]},
+        "buckets": [bucket.as_dict() for bucket in state["buckets"]],
+        "totals": state["totals"],
+        "peak_kw_upper_bound": state["peak_kw_upper_bound"],
+        "limiter": state["limiter"],
+    }
 
 
 def schedule_state(server: "Server", request: Request) -> Response:

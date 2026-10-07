@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from coldstore.ammonia import Monitor
 from coldstore.ammonia.monitor import THRESHOLD_KEY as AMMONIA_THRESHOLD_KEY
+from coldstore.accounting import Registry
+from coldstore.audit import Auditor
 from coldstore.evap import Condenser
 from coldstore.evap.condenser import BASELINE_KEY as EVAP_BASELINE_KEY
 from coldstore.evap.condenser import DEFAULT_BASELINE as EVAP_BASELINE
@@ -51,5 +53,7 @@ def seed_defaults(store: Store) -> None:
     scheduler = Scheduler(store)
     if not has_key(store, SCHEDULE_THRESHOLD_KEY):
         scheduler.set_threshold(SCHEDULE_THRESHOLD)
+
+    Registry(store, Auditor(store)).set_params()
 
     append_event(store, EVENT_KEY, "seed", "defaults")

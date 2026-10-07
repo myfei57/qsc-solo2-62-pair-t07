@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from coldstore.ammonia import Monitor
+from coldstore.accounting import Registry
 from coldstore.audit import Auditor
 from coldstore.comp import Bank
 from coldstore.defrost import Controller
@@ -39,4 +40,5 @@ class Runtime:
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
+        self.accounting = Registry(store, self.auditor)
         self.scheduler = Scheduler(store)

@@ -15,6 +15,8 @@ STATUS_TEXT = {
     400: "Bad Request",
     404: "Not Found",
     405: "Method Not Allowed",
+    409: "Conflict",
+    429: "Too Many Requests",
     500: "Internal Server Error",
 }
 

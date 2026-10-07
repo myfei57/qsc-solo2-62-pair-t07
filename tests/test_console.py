@@ -44,7 +44,17 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             {check["name"] for check in checks["checks"]},
-            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms"},
+            {
+                "store",
+                "interlock",
+                "ammonia",
+                "temp",
+                "compressors",
+                "fans",
+                "evap",
+                "rooms",
+                "accounting",
+            },
         )
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -67,6 +77,7 @@ class ConsoleCase(unittest.TestCase):
                 "quota",
                 "audit",
                 "schedule",
+                "accounting",
             },
         )
 
@@ -449,6 +460,158 @@ class ConsoleCase(unittest.TestCase):
         status, error = self.call("POST", "/room/add", {"id": "r1", "zone": -1})
         self.assertEqual(status, 400)
         self.assertIn("non-negative", error["error"])
+
+
+class AccountingCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = Store.open(f"{self._tmp.name}/state.json")
+        seed_defaults(self.store)
+        self.server = Server(self.store)
+        self.hour = 100 * 3600
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self._tmp.cleanup()
+
+    def call(self, method: str, path: str, payload: dict | None = None):
+        response = self.server.dispatch(method, path, payload)
+        body = response.body.decode("utf-8")
+        parsed = json.loads(body) if response.content_type.startswith("application/json") else body
+        return response.status, parsed
+
+    def test_register_voucher_ledger_and_policy(self) -> None:
+        status, body = self.call(
+            "POST",
+            "/accounting/register",
+            {"batch_id": "b1", "at": self.hour, "mass_kg": 1000.0, "product_temp": -10.0},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["accepted"])
+        energy = body["voucher"]["energy_kwh"]
+        self.assertAlmostEqual(energy, 6.6666667, places=5)
+        self.assertEqual(body["bucket"]["inbound_kwh"], energy)
+        self.assertEqual(body["voucher"]["policy"], "accounting-v1")
+
+        status, body = self.call("POST", "/accounting/voucher", {"batch_id": "b1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["voucher"]["energy_kwh"], energy)
+
+        status, body = self.call("GET", "/accounting/reconcile")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["matches"])
+        self.assertEqual(body["difference_kwh"], 0.0)
+        self.assertEqual(body["basis"], "hourly_integral_kwh")
+
+        status, audit = self.call("GET", "/audit")
+        kinds = {entry["kind"] for entry in audit["entries"]}
+        self.assertIn("accounting-voucher", kinds)
+        self.assertIn("accounting-ledger", kinds)
+
+    def test_duplicate_conflict_and_missing_404(self) -> None:
+        payload = {"batch_id": "b1", "at": self.hour, "mass_kg": 100.0, "product_temp": -10.0}
+        self.call("POST", "/accounting/register", payload)
+        status, body = self.call("POST", "/accounting/register", payload)
+        self.assertEqual(status, 409)
+        self.assertIn("already registered", body["error"])
+        status, body = self.call("POST", "/accounting/voucher", {"batch_id": "ghost"})
+        self.assertEqual(status, 404)
+
+    def test_limiter_shapes_flood_and_resets_with_params(self) -> None:
+        status, _ = self.call(
+            "POST",
+            "/accounting/params",
+            {"rate_per_hour": 1.0, "rate_burst": 2.0},
+        )
+        self.assertEqual(status, 200)
+        accepted = 0
+        rejected = 0
+        for index in range(4):
+            status, body = self.call(
+                "POST",
+                "/accounting/register",
+                {"batch_id": f"b{index}", "at": self.hour, "mass_kg": 10.0, "product_temp": -10.0},
+            )
+            if status == 429:
+                rejected += 1
+                self.assertFalse(body["accepted"])
+            else:
+                accepted += 1
+        self.assertEqual((accepted, rejected), (2, 2))
+        # After an hour the single per-hour token has refilled.
+        status, body = self.call(
+            "POST",
+            "/accounting/register",
+            {"batch_id": "b9", "at": self.hour + 3600, "mass_kg": 10.0, "product_temp": -10.0},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["accepted"])
+
+    def test_load_composition_zero_fill_and_export(self) -> None:
+        self.call(
+            "POST",
+            "/accounting/register",
+            {"batch_id": "b1", "at": self.hour, "mass_kg": 1000.0, "product_temp": -10.0},
+        )
+        self.call(
+            "POST",
+            "/accounting/defrost",
+            {"room_id": "r1", "start": self.hour, "end": self.hour + 1800},
+        )
+        status, body = self.call(
+            "POST",
+            "/accounting/load",
+            {"start": self.hour, "end": self.hour + 2 * 3600},
+        )
+        self.assertEqual(status, 200)
+        buckets = body["buckets"]
+        self.assertEqual(len(buckets), 3)
+        self.assertFalse(buckets[0]["zero_filled"])
+        self.assertTrue(buckets[1]["zero_filled"])
+        self.assertAlmostEqual(buckets[0]["defrost_kwh"], 3.0)
+        self.assertEqual(buckets[0]["envelope_kwh"], 0.0)
+        self.assertGreater(buckets[0]["inbound_kwh"], 0.0)
+
+        status, csv_body = self.call(
+            "POST",
+            "/export/accounting",
+            {"start": self.hour, "end": self.hour + 3600},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("inbound_kwh,envelope_kwh,defrost_kwh", csv_body)
+
+    def test_state_carries_policy_and_budget(self) -> None:
+        status, body = self.call("GET", "/accounting")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["policy"]["basis"], "hourly_integral_kwh")
+        self.assertEqual(body["policy"]["missing"], "zero_fill")
+        self.assertIn("max_span_buckets", body["params"])
+        self.assertIn("tokens", body["limiter"])
+
+    def test_budget_rejects_long_defrost(self) -> None:
+        self.call("POST", "/accounting/params", {"max_span_buckets": 2})
+        status, body = self.call(
+            "POST",
+            "/accounting/defrost",
+            {"room_id": "r1", "start": self.hour, "end": self.hour + 5 * 3600},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("performance budget", body["error"])
+
+    def test_validation_errors(self) -> None:
+        status, body = self.call(
+            "POST",
+            "/accounting/register",
+            {"batch_id": "", "at": self.hour, "mass_kg": 10.0, "product_temp": -10.0},
+        )
+        self.assertEqual(status, 400)
+        status, body = self.call(
+            "POST",
+            "/accounting/register",
+            {"batch_id": "b1", "at": self.hour, "mass_kg": -1.0, "product_temp": -10.0},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("mass", body["error"])
 
 
 class WsgiCase(unittest.TestCase):

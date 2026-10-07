@@ -56,4 +56,18 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
     else:
         checks.append({"name": "rooms", "status": "ok", "detail": "every room assigned"})
 
+    reconciliation = rt.accounting.reconcile()
+    if reconciliation.matches:
+        checks.append(
+            {"name": "accounting", "status": "ok", "detail": f"vouchers match ledger ({reconciliation.vouchers})"}
+        )
+    else:
+        checks.append(
+            {
+                "name": "accounting",
+                "status": "fail",
+                "detail": f"voucher/ledger difference {reconciliation.difference_kwh:.4f} kWh",
+            }
+        )
+
     return checks

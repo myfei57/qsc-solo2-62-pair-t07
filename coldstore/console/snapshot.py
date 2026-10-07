@@ -27,4 +27,18 @@ def collect(rt: Runtime) -> dict[str, object]:
         "quota": rt.accumulator.state().as_dict(),
         "audit": rt.auditor.state().as_dict(),
         "schedule": rt.scheduler.state(rt.rooms).as_dict(),
+        "accounting": _accounting_snapshot(rt),
+    }
+
+
+def _accounting_snapshot(rt: Runtime) -> dict[str, object]:
+    state = rt.accounting.state()
+    return {
+        "policy": state["policy"],
+        "params": state["params"].as_dict(),
+        "totals": state["totals"],
+        "peak_kw_upper_bound": state["peak_kw_upper_bound"],
+        "vouchers": len(state["vouchers"]),
+        "buckets": len(state["buckets"]),
+        "reconciliation": rt.accounting.reconcile().as_dict(),
     }

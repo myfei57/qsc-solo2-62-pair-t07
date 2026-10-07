@@ -57,5 +57,6 @@ def text_report(rt: Runtime) -> str:
         ),
         f"cooling load={telemetry.cooling_load:.4f} due={telemetry.schedule_due}",
         f"quota value={telemetry.quota_value:.4f} open valves={telemetry.supply_open}",
+        f"accounting: {collect_describe(rt)['accounting']}",
     ]
     return "\n".join(rows) + "\n"

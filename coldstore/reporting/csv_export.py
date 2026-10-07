@@ -40,3 +40,26 @@ def telemetry_export(telemetry: Telemetry) -> tuple[list[str], list[list[object]
     """Columns and rows for the telemetry counters."""
 
     return ["metric", "value"], [[key, value] for key, value in telemetry.as_dict().items()]
+
+
+def accounting_export(buckets: Sequence[object]) -> tuple[list[str], list[list[object]]]:
+    """Columns and rows for the itemised hourly load ledger."""
+
+    columns = [
+        "hour",
+        "inbound_kwh",
+        "envelope_kwh",
+        "defrost_kwh",
+        "total_kwh",
+        "inbound_peak_kw",
+        "envelope_peak_kw",
+        "defrost_peak_kw",
+        "peak_kw_upper_bound",
+        "records",
+        "zero_filled",
+    ]
+    rows: list[list[object]] = []
+    for bucket in buckets:
+        data = bucket.as_dict()  # type: ignore[attr-defined]
+        rows.append([data[column] for column in columns])
+    return columns, rows
