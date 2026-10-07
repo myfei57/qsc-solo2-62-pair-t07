@@ -56,4 +56,16 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
     else:
         checks.append({"name": "rooms", "status": "ok", "detail": "every room assigned"})
 
+    ledger = rt.ledger.state()
+    if ledger.rejected > 0:
+        checks.append(
+            {"name": "ledger", "status": "warn", "detail": f"registrations rejected={ledger.rejected}"}
+        )
+    elif ledger.pending > 0:
+        checks.append(
+            {"name": "ledger", "status": "warn", "detail": f"settlement pending={ledger.pending}"}
+        )
+    else:
+        checks.append({"name": "ledger", "status": "ok", "detail": "settlement up to date"})
+
     return checks

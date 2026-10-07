@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 
@@ -14,6 +15,7 @@ from coldstore.defrost import Controller as DefrostController
 from coldstore.evap import Condenser, validate_baseline as validate_evap_baseline
 from coldstore.fan import PRIMARY, STANDBY, FanSet
 from coldstore.interlock import Interlock
+from coldstore.ledger import Ledger, RateLimited
 from coldstore.load import LoadCalculator, compute_load, validate_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Accumulator, Quota, check_quota, validate_amount
@@ -502,6 +504,151 @@ class LoadCase(unittest.TestCase):
             validate_baseline(-200.0)
         with self.assertRaises(ValueError):
             validate_baseline(200.0)
+
+
+class LedgerCase(unittest.TestCase):
+    def build_ledger(self, store: Store, rooms: RoomRegistry) -> Ledger:
+        calculator = LoadCalculator(store)
+        auditor = Auditor(store)
+        return Ledger(store, rooms, calculator, auditor)
+
+    def test_register_settle_and_reconcile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            rooms = RoomRegistry()
+            rooms.add_room("r1", 1, -18.0)
+            rooms.add_room("r2", 2, -20.0)
+            ledger = self.build_ledger(store, rooms)
+            auditor = Auditor(store)
+            hour = 3600 * 1000
+
+            first = ledger.register("b1", "r1", 1000.0, -4.0, at=hour)
+            self.assertAlmostEqual(first.heat_kwh, 14.0)
+            self.assertEqual(first.target, -18.0)
+            second = ledger.register("b2", "r2", 500.0, -8.0, at=hour)
+            self.assertAlmostEqual(second.heat_kwh, 5.0)
+            ledger.record_defrost("r1", at=hour)
+
+            result = ledger.settle(hour)
+            self.assertEqual(len(result.settled), 1)
+            self.assertEqual(result.backlog, 0)
+            item = result.settled[0]
+            self.assertAlmostEqual(item.inbound_kwh, 19.0)
+            self.assertAlmostEqual(item.envelope_kwh, 70.4)
+            self.assertAlmostEqual(item.defrost_kwh, 6.0)
+            self.assertAlmostEqual(item.total_kwh, 95.4)
+            self.assertEqual(item.vouchers, 2)
+            self.assertEqual(item.gap_policy, "zero")
+            self.assertEqual(item.caliber, "hourly_energy")
+
+            report = ledger.reconcile(hour, hour)
+            self.assertTrue(report["consistent"])
+            self.assertEqual(report["hours_checked"], 1)
+            self.assertEqual(report["mismatches"], [])
+
+            load = ledger.load_range(hour, hour)
+            self.assertAlmostEqual(load["totals"]["total_kwh"], 95.4)
+            self.assertEqual(load["peak"]["hour"], hour)
+            self.assertEqual(load["pending"], [])
+
+            self.assertEqual(len(auditor.filter("ledger.voucher")), 2)
+            self.assertEqual(len(auditor.filter("ledger.settle")), 1)
+
+            state = ledger.state()
+            self.assertEqual(state.cursor, hour)
+            self.assertEqual(state.settled, 1)
+            self.assertEqual(state.gap_policy, "zero")
+            self.assertEqual(state.caliber, "hourly_energy")
+            self.assertIn("ledger cursor=", ledger.describe())
+
+    def test_rate_limit_shaves_the_flood(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            rooms = RoomRegistry()
+            rooms.add_room("r1", 1, -18.0)
+            ledger = self.build_ledger(store, rooms)
+            ledger.update_config({"burst": 2.0, "rate_per_hour": 3.6})
+            hour = 3600 * 1000
+
+            ledger.register("b1", "r1", 10.0, -4.0, at=hour)
+            ledger.register("b2", "r1", 10.0, -4.0, at=hour)
+            with self.assertRaises(RateLimited):
+                ledger.register("b3", "r1", 10.0, -4.0, at=hour)
+            self.assertEqual(ledger.state().rejected, 1)
+            self.assertEqual(len(ledger.vouchers_for(hour)), 2)
+
+    def test_settle_budget_and_zero_filled_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            rooms = RoomRegistry()
+            rooms.add_room("r1", 1, -18.0)
+            ledger = self.build_ledger(store, rooms)
+            ledger.update_config({"budget": 1.0})
+            hour = 3600 * 1000
+            ledger.register("b1", "r1", 10.0, -4.0, at=hour)
+
+            first = ledger.settle(hour + 2 * 3600)
+            self.assertEqual(len(first.settled), 1)
+            self.assertEqual(first.backlog, 2)
+            second = ledger.settle(hour + 2 * 3600)
+            self.assertEqual(len(second.settled), 1)
+            self.assertEqual(second.backlog, 1)
+            gap = second.settled[0]
+            self.assertEqual(gap.hour, hour + 3600)
+            self.assertEqual(gap.inbound_kwh, 0.0)
+            self.assertEqual(gap.vouchers, 0)
+            self.assertEqual(gap.gap_policy, "zero")
+            third = ledger.settle(hour + 2 * 3600)
+            self.assertEqual(third.backlog, 0)
+
+    def test_register_rejects_settled_hours_and_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            rooms = RoomRegistry()
+            rooms.add_room("r1", 1, -18.0)
+            ledger = self.build_ledger(store, rooms)
+            hour = 3600 * 1000
+            ledger.register("b1", "r1", 10.0, -4.0, at=hour)
+            with self.assertRaises(ValueError):
+                ledger.register("b1", "r1", 10.0, -4.0, at=hour)
+            with self.assertRaises(ValueError):
+                ledger.register("b2", "ghost", 10.0, -4.0, at=hour)
+            with self.assertRaises(ValueError):
+                ledger.register("b2", "r1", 0.0, -4.0, at=hour)
+            ledger.settle(hour)
+            with self.assertRaises(ValueError):
+                ledger.register("b2", "r1", 10.0, -4.0, at=hour)
+
+    def test_reconcile_detects_drift_and_orphans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            rooms = RoomRegistry()
+            rooms.add_room("r1", 1, -18.0)
+            ledger = self.build_ledger(store, rooms)
+            hour = 3600 * 1000
+            ledger.register("b1", "r1", 10.0, -4.0, at=hour)
+            ledger.settle(hour)
+
+            item = ledger.load_range(hour, hour)["hours"][0]
+            item["inbound_kwh"] = 999.0
+            store.put(f"ledger:slices:{hour}", json.dumps(item))
+            append_command(store, f"ledger:vouchers:{hour - 3600}", "{}")
+
+            report = ledger.reconcile(hour - 3600, hour)
+            self.assertFalse(report["consistent"])
+            self.assertEqual(report["mismatches"][0]["field"], "inbound_kwh")
+            self.assertEqual(report["orphan_voucher_hours"], [hour - 3600])
+
+    def test_defrost_controller_notifies_listeners(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            fans = FanSet()
+            rooms = RoomRegistry()
+            rooms.add_room("r1", 1)
+            seen: list[str] = []
+            controller = DefrostController(fans, rooms, store, listeners=(seen.append,))
+            controller.start("r1")
+            self.assertEqual(seen, ["r1"])
 
 
 class QuotaCase(unittest.TestCase):

@@ -34,6 +34,9 @@ class Telemetry:
     evap_above: bool
     defrost_warmups: int
     cooling_load: float
+    ledger_settled: int
+    ledger_pending: int
+    ledger_rejected: int
     quota_value: float
     audit_entries: int
     schedule_due: int
@@ -63,6 +66,9 @@ class Telemetry:
             "evap_above": self.evap_above,
             "defrost_warmups": self.defrost_warmups,
             "cooling_load": self.cooling_load,
+            "ledger_settled": self.ledger_settled,
+            "ledger_pending": self.ledger_pending,
+            "ledger_rejected": self.ledger_rejected,
             "quota_value": self.quota_value,
             "audit_entries": self.audit_entries,
             "schedule_due": self.schedule_due,
@@ -98,6 +104,9 @@ def collect(rt: Runtime) -> Telemetry:
         evap_above=rt.evap.above_baseline(),
         defrost_warmups=rt.defrost.warmup_count(),
         cooling_load=rt.load.total(rt.rooms),
+        ledger_settled=rt.ledger.state().settled,
+        ledger_pending=rt.ledger.state().pending,
+        ledger_rejected=rt.ledger.state().rejected,
         quota_value=rt.accumulator.value(),
         audit_entries=rt.auditor.count(),
         schedule_due=len(rt.scheduler.due(rt.rooms)),

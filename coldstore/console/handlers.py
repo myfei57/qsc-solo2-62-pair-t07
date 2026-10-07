@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 from coldstore.ammonia import validate_ppm, validate_threshold
 from coldstore.comp import validate_stage
 from coldstore.evap import validate_baseline
 from coldstore.fan import PRIMARY, STANDBY
+from coldstore.ledger import GAP_POLICY, HOUR_SECONDS, RateLimited, hour_floor
 from coldstore.load import validate_baseline as validate_load_baseline
 from coldstore.ns import Stage, control_line
 from coldstore.quota import Quota, check_quota, validate_amount
@@ -24,7 +26,7 @@ from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import Request, RequestError, Response, csv_response, json_response, text_response
 from .report import text_report
 from .routes import route_table
 from .system import system_payload
@@ -595,6 +597,88 @@ def load_coefficient(server: "Server", request: Request) -> Response:
 
 def load_estimate(server: "Server", request: Request) -> Response:
     return json_response(server.runtime.load.estimate(request.float_field("temp")).as_dict())
+
+
+def _hour_field(request: Request, name: str) -> int:
+    """Read an hour field from the payload, falling back to the query string."""
+
+    raw: object = request.payload.get(name)
+    if raw is None:
+        values = request.query.get(name)
+        raw = values[0] if values else None
+    if raw is None or raw == "":
+        return 0
+    try:
+        return int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"field {name} must be an integer") from exc
+
+
+def _range_hours(request: Request) -> tuple[int, int]:
+    """Resolve the monitoring range, defaulting to the last closed 24 hours."""
+
+    to_hour = _hour_field(request, "to")
+    if to_hour <= 0:
+        to_hour = hour_floor(int(time.time())) - HOUR_SECONDS
+    from_hour = _hour_field(request, "from")
+    if from_hour <= 0:
+        from_hour = to_hour - 23 * HOUR_SECONDS
+    return from_hour, to_hour
+
+
+def ledger_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.ledger.state().as_dict())
+
+
+def ledger_config(server: "Server", request: Request) -> Response:
+    changes = {name: request.float_field(name) for name in request.payload}
+    if not changes:
+        raise ValueError("no config field supplied")
+    return json_response({"config": server.runtime.ledger.update_config(changes)})
+
+
+def ledger_register(server: "Server", request: Request) -> Response:
+    at = request.int_field("at", 0)
+    try:
+        voucher = server.runtime.ledger.register(
+            request.str_field("id"),
+            request.str_field("room"),
+            request.float_field("mass"),
+            request.float_field("temp"),
+            at=at if at > 0 else None,
+        )
+    except RateLimited as exc:
+        raise RequestError(429, str(exc)) from exc
+    return json_response(voucher.as_dict())
+
+
+def ledger_vouchers(server: "Server", request: Request) -> Response:
+    hour = _hour_field(request, "hour")
+    vouchers = server.runtime.ledger.vouchers_for(hour)
+    return json_response(
+        {
+            "hour": hour,
+            "vouchers": [voucher.as_dict() for voucher in vouchers],
+            "count": len(vouchers),
+            "gap_policy": GAP_POLICY,
+        }
+    )
+
+
+def ledger_settle(server: "Server", request: Request) -> Response:
+    to_hour = _hour_field(request, "to")
+    result = server.runtime.ledger.settle(to_hour if to_hour > 0 else None)
+    return json_response(result.as_dict())
+
+
+def ledger_load(server: "Server", request: Request) -> Response:
+    from_hour, to_hour = _range_hours(request)
+    return json_response(server.runtime.ledger.load_range(from_hour, to_hour))
+
+
+def ledger_reconcile(server: "Server", request: Request) -> Response:
+    from_hour, to_hour = _range_hours(request)
+    return json_response(server.runtime.ledger.reconcile(from_hour, to_hour))
 
 
 def quota_add(server: "Server", request: Request) -> Response:

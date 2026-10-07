@@ -30,6 +30,7 @@ def text_report(rt: Runtime) -> str:
         f"evap: {describe['evap']}",
         f"defrost: {describe['defrost']}",
         f"load: {describe['load']}",
+        f"ledger: {describe['ledger']}",
         f"quota: {describe['quota']}",
         f"audit: {describe['audit']}",
         f"audit kinds={rt.auditor.kinds()}",

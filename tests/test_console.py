@@ -44,7 +44,7 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             {check["name"] for check in checks["checks"]},
-            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms"},
+            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms", "ledger"},
         )
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -64,6 +64,7 @@ class ConsoleCase(unittest.TestCase):
                 "evap",
                 "defrost",
                 "load",
+                "ledger",
                 "quota",
                 "audit",
                 "schedule",
@@ -341,6 +342,101 @@ class ConsoleCase(unittest.TestCase):
         self.assertTrue(body["ok"])
         status, body = self.call("POST", "/quota/reset", {})
         self.assertEqual(body["value"], 0.0)
+
+    def test_ledger_routes(self) -> None:
+        self.add_room("r1", 1, -18.0)
+        hour = 3600 * 1000
+
+        status, body = self.call(
+            "POST", "/ledger/register", {"id": "b1", "room": "r1", "mass": 1000.0, "temp": -4.0, "at": hour}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["hour"], hour)
+        self.assertAlmostEqual(body["heat_kwh"], 14.0)
+        status, body = self.call(
+            "POST", "/ledger/register", {"id": "b2", "room": "r1", "mass": 500.0, "temp": -8.0, "at": hour}
+        )
+        self.assertAlmostEqual(body["heat_kwh"], 5.0)
+
+        status, body = self.call("GET", "/ledger/vouchers", {"hour": hour})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["count"], 2)
+        self.assertEqual(body["gap_policy"], "zero")
+
+        status, body = self.call("POST", "/ledger/settle", {"to": hour})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["settled"]), 1)
+        self.assertEqual(body["backlog"], 0)
+        item = body["settled"][0]
+        self.assertAlmostEqual(item["inbound_kwh"], 19.0)
+        self.assertAlmostEqual(item["envelope_kwh"], 34.4)
+        self.assertEqual(item["defrost_kwh"], 0.0)
+        self.assertEqual(item["caliber"], "hourly_energy")
+
+        status, body = self.call("GET", "/ledger/load", {"from": hour, "to": hour})
+        self.assertEqual(status, 200)
+        self.assertAlmostEqual(body["totals"]["inbound_kwh"], 19.0)
+        self.assertAlmostEqual(body["totals"]["total_kwh"], 53.4)
+        self.assertEqual(body["peak"]["hour"], hour)
+        self.assertEqual(body["pending"], [])
+
+        status, body = self.call("GET", "/ledger/reconcile", {"from": hour, "to": hour})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["consistent"])
+        self.assertEqual(body["hours_checked"], 1)
+
+        status, body = self.call("GET", "/ledger")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["cursor"], hour)
+        self.assertEqual(body["gap_policy"], "zero")
+        self.assertEqual(body["caliber"], "hourly_energy")
+
+        status, error = self.call(
+            "POST", "/ledger/register", {"id": "b3", "room": "r1", "mass": 1.0, "temp": -4.0, "at": hour}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("already settled", error["error"])
+
+        status, body = self.call("POST", "/audit/filter", {"kind": "ledger.voucher"})
+        self.assertEqual(len(body["entries"]), 2)
+        status, body = self.call("POST", "/audit/filter", {"kind": "ledger.settle"})
+        self.assertEqual(len(body["entries"]), 1)
+
+    def test_ledger_rate_limit_and_budget(self) -> None:
+        self.add_room("r1", 1, -18.0)
+        hour = 3600 * 1000
+
+        status, body = self.call("POST", "/ledger/config", {"burst": 1.0, "rate_per_hour": 3.6})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["config"]["burst"], 1.0)
+
+        status, _ = self.call(
+            "POST", "/ledger/register", {"id": "b1", "room": "r1", "mass": 10.0, "temp": -4.0, "at": hour}
+        )
+        self.assertEqual(status, 200)
+        status, error = self.call(
+            "POST", "/ledger/register", {"id": "b2", "room": "r1", "mass": 10.0, "temp": -4.0, "at": hour}
+        )
+        self.assertEqual(status, 429)
+        self.assertIn("rate limited", error["error"])
+        status, body = self.call("GET", "/ledger")
+        self.assertEqual(body["rejected"], 1)
+
+        status, body = self.call("POST", "/ledger/config", {"budget": 2.0})
+        self.assertEqual(body["config"]["budget"], 2.0)
+        status, body = self.call("POST", "/ledger/settle", {"to": hour + 2 * 3600})
+        self.assertEqual(len(body["settled"]), 2)
+        self.assertEqual(body["backlog"], 1)
+        self.assertEqual(body["settled"][0]["vouchers"], 1)
+        gap = body["settled"][1]
+        self.assertEqual(gap["hour"], hour + 3600)
+        self.assertEqual(gap["inbound_kwh"], 0.0)
+        self.assertEqual(gap["vouchers"], 0)
+        self.assertEqual(gap["gap_policy"], "zero")
+
+        status, error = self.call("POST", "/ledger/config", {"nonsense": 1.0})
+        self.assertEqual(status, 400)
+        self.assertIn("unknown config field", error["error"])
 
     def test_audit_and_schedule_routes(self) -> None:
         self.call("POST", "/temp/read", {"value": -18.0})

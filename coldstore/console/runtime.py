@@ -9,6 +9,7 @@ from coldstore.defrost import Controller
 from coldstore.evap import Condenser
 from coldstore.fan import FanSet
 from coldstore.interlock import Interlock
+from coldstore.ledger import Ledger
 from coldstore.load import LoadCalculator
 from coldstore.quota import Accumulator
 from coldstore.room import RoomRegistry
@@ -35,8 +36,11 @@ class Runtime:
         self.cold_fans = cold_fans
         self.evap_fans = evap_fans
         self.evap = Condenser(store, evap_fans)
-        self.defrost = Controller(cold_fans, rooms, store)
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
+        self.ledger = Ledger(store, rooms, self.load, self.auditor)
+        self.defrost = Controller(
+            cold_fans, rooms, store, listeners=(self.ledger.record_defrost,)
+        )
         self.scheduler = Scheduler(store)

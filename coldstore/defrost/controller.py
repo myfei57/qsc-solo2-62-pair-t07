@@ -2,10 +2,13 @@
 
 Every defrost follows the same sequence: the cold air fan stops first, then
 the warm up is recorded against the room. The command queue is persisted so an
-interrupted console can replay or discard pending work.
+interrupted console can replay or discard pending work. Registered listeners
+are notified after every start so the load ledger sees the same events.
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 from coldstore.fan import FanSet
 from coldstore.room import RoomRegistry
@@ -23,10 +26,17 @@ SPILL_KEY = "defrost:spill"
 class Controller:
     """Sequences defrost steps against the cold fans and rooms."""
 
-    def __init__(self, fans: FanSet, rooms: RoomRegistry, store: Store) -> None:
+    def __init__(
+        self,
+        fans: FanSet,
+        rooms: RoomRegistry,
+        store: Store,
+        listeners: tuple[Callable[[str], None], ...] = (),
+    ) -> None:
         self._fans = fans
         self._rooms = rooms
         self._store = store
+        self._listeners = listeners
 
     def start(self, room_id: str) -> None:
         """Stop the fan first and only then begin the warm up."""
@@ -34,6 +44,8 @@ class Controller:
         self._fans.stop_all()
         self._warm(room_id)
         self._rooms.set_defrosting(room_id, True)
+        for listener in self._listeners:
+            listener(room_id)
 
     def _warm(self, room_id: str) -> None:
         if self._fans.running_ids():
